@@ -576,11 +576,16 @@ impl<'d, T: Instance> PdPhy<'d, T> {
                 r.imr().set_bits(|w| w.set_rxhrstdetie(true));
                 Poll::Ready(Err(RxError::HardReset))
             } else if sr.rxmsgend() {
-                dma.request_pause();
                 // Should be read immediately on interrupt.
                 rxpaysz = r.rx_payszr().read().rxpaysz().into();
 
-                let ret = if sr.rxovr() {
+                // Let the DMA fetch the last byte before stopping it. While it runs it empties
+                // RXDR within a few cycles, unless the buffer is full.
+                while r.sr().read().rxne() && dma.get_remaining_transfers() != 0 {}
+                let byte_left = r.sr().read().rxne();
+                dma.request_pause();
+
+                let ret = if sr.rxovr() || byte_left {
                     Err(RxError::Overrun)
                 } else if sr.rxerr() {
                     Err(RxError::Crc)
@@ -595,13 +600,6 @@ impl<'d, T: Instance> PdPhy<'d, T> {
             }
         })
         .await?;
-
-        // Make sure that the last byte was fetched by DMA.
-        while r.sr().read().rxne() {
-            if dma.get_remaining_transfers() == 0 {
-                return Err(RxError::Overrun);
-            }
-        }
 
         let sop = match r.rx_ordsetr().read().rxordset() {
             Rxordset::Sop => Sop::Sop,
