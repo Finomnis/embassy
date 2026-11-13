@@ -11,6 +11,7 @@ use embassy_futures::join::join;
 use embassy_stm32::ucpd::{self, CcPhy, CcPull, CcSel, CcVState, RxError, Ucpd};
 use embassy_stm32::{Peri, bind_interrupts, peripherals};
 use embassy_time::Timer;
+use static_cell::StaticCell;
 
 bind_interrupts!(struct Irqs {
     UCPD1_2 => ucpd::InterruptHandler<peripherals::UCPD1>, ucpd::InterruptHandler<peripherals::UCPD2>;
@@ -46,7 +47,8 @@ async fn source(
     debug!("source: sink detected, setting 3.0A current pull-up");
     ucpd.cc_phy().set_pull(CcPull::Source3_0A);
 
-    let (_, mut pd_phy) = ucpd.split_pd_phy(rx_dma, tx_dma, Irqs, CcSel::Cc1);
+    static RX_BUF: StaticCell<[u8; 1024]> = StaticCell::new();
+    let (_, mut pd_phy) = ucpd.split_pd_phy(rx_dma, tx_dma, Irqs, CcSel::Cc1, RX_BUF.init([0; 1024]));
 
     // Listen for an incoming message
     debug!("source: wait for message from sink");
@@ -86,7 +88,8 @@ async fn sink(
     // TODO: not working yet, why? no idea, replace with timer for now
     Timer::after_millis(100).await;
 
-    let (_, mut pd_phy) = ucpd.split_pd_phy(rx_dma, tx_dma, Irqs, CcSel::Cc1);
+    static RX_BUF: StaticCell<[u8; 1024]> = StaticCell::new();
+    let (_, mut pd_phy) = ucpd.split_pd_phy(rx_dma, tx_dma, Irqs, CcSel::Cc1, RX_BUF.init([0; 1024]));
 
     // Send message
     debug!("sink: sending message");

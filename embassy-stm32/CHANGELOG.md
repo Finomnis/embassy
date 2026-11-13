@@ -26,6 +26,8 @@ UCPD:
 - fix: stm32/ucpd: when `CcPhy` and `PdPhy` were dropped at the same time from different priority levels, the peripheral could be left enabled.
 - fix: stm32/ucpd: update the control register (CR) without lost updates or repeated commands. `CcPhy` and `PdPhy` could overwrite each other's settings, and any CR update could write back a `TXSEND` or `TXHRST` the hardware had just cleared, sending a message or Hard Reset twice.
 - feat: stm32/ucpd: add `Ucpd::split_idle_pd_phy`, which keeps the `CcPhy` and an `IdlePdPhy` for the whole lifetime of the driver. `IdlePdPhy::activate` enables PD on a CC line and returns an `ActivePdPhy` guard that disables it again when dropped, so PD can be turned on and off on every attach and detach without recreating `Ucpd` or touching the CC terminations.
+- change: stm32/ucpd: `Ucpd::split_pd_phy` and `IdlePdPhy::activate` take a ring buffer for receiving PD messages, `rx_buf`. `ActivePdPhy` has only one lifetime parameter now.
+- fix: stm32/ucpd: PD messages are received continuously, by a DMA running for as long as PD is enabled, instead of only while `PdPhy::receive` is pending. Messages arriving between two `receive` calls were lost, and could leave a stale byte that the next reception put in front of its message ([#7527](https://github.com/embassy-rs/embassy/issues/7527)).
 
 VREFBUF:
 - feat: stm32/vrefbuf g0x1: enable the VREFBUF clock. On G0x1, including G0B1, it is `SYSCFGEN` in `RCC_APBENR2`, shared with SYSCFG and COMP (RM0444 5.4.16). Without it `VoltageReferenceBuffer::new` never sees `VRR` and waits forever.

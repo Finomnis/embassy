@@ -116,6 +116,8 @@ async fn main(_spawner: Spawner) {
     ucpd.cc_phy().set_pull(CcPull::Sink);
 
     // Both parts are kept across attach/detach cycles; PD is only enabled while attached.
+    // PD messages are received continuously into `rx_buf`, a ring buffer, while PD is enabled.
+    let mut rx_buf = [0u8; 1024];
     let (mut cc_phy, mut pd_phy) = ucpd.split_idle_pd_phy(p.DMA1_CH1, p.DMA1_CH2, Irqs);
 
     loop {
@@ -134,7 +136,7 @@ async fn main(_spawner: Spawner) {
         };
 
         info!("Starting PD communication on {}", cc_sel);
-        let mut active_pd_phy = pd_phy.activate(cc_sel);
+        let mut active_pd_phy = pd_phy.activate(cc_sel, &mut rx_buf);
         match select(wait_detached(&mut cc_phy), receive_messages(&mut active_pd_phy)).await {
             Either::First(()) => {}
             Either::Second(()) => {

@@ -8,6 +8,7 @@ use embassy_stm32::ucpd::{self, CcPhy, CcPull, CcSel, CcVState, Ucpd};
 use embassy_stm32::{Config, bind_interrupts, dma, peripherals};
 use embassy_time::{Duration, with_timeout};
 use panic_probe as _;
+use static_cell::StaticCell;
 
 bind_interrupts!(struct Irqs {
     UCPD1 => ucpd::InterruptHandler<peripherals::UCPD1>;
@@ -76,7 +77,10 @@ async fn main(_spawner: Spawner) {
         }
         CableOrientation::DebugAccessoryMode => panic!("No PD communication in DAM"),
     };
-    let (_cc_phy, mut pd_phy) = ucpd.split_pd_phy(p.DMA1_CH1, p.DMA1_CH2, Irqs, cc_sel);
+    // PD messages are received continuously into this ring buffer.
+    static RX_BUF: StaticCell<[u8; 1024]> = StaticCell::new();
+    let rx_buf = RX_BUF.init([0; 1024]);
+    let (_cc_phy, mut pd_phy) = ucpd.split_pd_phy(p.DMA1_CH1, p.DMA1_CH2, Irqs, cc_sel, rx_buf);
 
     loop {
         // Enough space for the longest non-extended data message.

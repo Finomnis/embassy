@@ -14,18 +14,20 @@
 // be disabled by setting a bit in PWR/SYSCFG registers. The exact name and location for that
 // bit is different for each familily.
 
+use core::cell::RefCell;
 use core::future::poll_fn;
 use core::marker::PhantomData;
 use core::ops::{Deref, DerefMut};
 use core::sync::atomic::{AtomicBool, Ordering};
 use core::task::Poll;
 
+use critical_section::Mutex;
 use embassy_hal_internal::PeripheralType;
 use embassy_hal_internal::drop::OnDrop;
 use embassy_sync::waitqueue::AtomicWaker;
 
 use crate::atomic::{AtomicClear, AtomicModify};
-use crate::dma::{ChannelAndRequest, TransferOptions};
+use crate::dma::{ChannelAndRequest, ReadableRingBuffer, TransferOptions};
 use crate::interrupt::typelevel::Interrupt;
 use crate::pac::ucpd::vals::{Anamode, Ccenable, PscUsbpdclk, Txmode};
 pub use crate::pac::ucpd::vals::{Phyccsel as CcSel, Rxordset, TypecVstateCc as CcVState};
@@ -219,6 +221,10 @@ impl<'d, T: Instance> Ucpd<'d, T> {
 
     /// Splits the UCPD driver into a TypeC PHY to control and monitor CC voltage
     /// and a Power Delivery (PD) PHY with receiver and transmitter.
+    ///
+    /// PD messages are received continuously into `rx_buf`, a ring buffer, until the
+    /// [`PdPhy`] is dropped. It must hold at least one message of the largest size (264 bytes);
+    /// a few times that leaves room for messages that wait for [`PdPhy::receive`].
     pub fn split_pd_phy<RX, TX>(
         self,
         rx_dma: Peri<'d, RX>,
@@ -227,13 +233,16 @@ impl<'d, T: Instance> Ucpd<'d, T> {
         + interrupt::typelevel::Binding<TX::Interrupt, crate::dma::InterruptHandler<TX>>
         + 'd,
         cc_sel: CcSel,
+        rx_buf: &'d mut [u8],
     ) -> (CcPhy<'d, T>, PdPhy<'d, T>)
     where
         RX: RxDma<T>,
         TX: TxDma<T>,
     {
-        enable_pd::<T>(cc_sel);
-        self.split_disabled_pd_phy(rx_dma, tx_dma, irqs)
+        let (cc_phy, rx_dma, tx_dma, part) = self.split_dma(rx_dma, tx_dma, irqs);
+        let mut pd_phy = PdPhy::new(rx_dma, tx_dma, rx_buf, Some(part));
+        pd_phy.start_reception(cc_sel);
+        (cc_phy, pd_phy)
     }
 
     /// Splits the UCPD driver like [`split_pd_phy`](Self::split_pd_phy), but with PD
@@ -254,18 +263,25 @@ impl<'d, T: Instance> Ucpd<'d, T> {
         RX: RxDma<T>,
         TX: TxDma<T>,
     {
-        let (cc_phy, pd_phy) = self.split_disabled_pd_phy(rx_dma, tx_dma, irqs);
-        (cc_phy, IdlePdPhy { pd_phy })
+        let (cc_phy, rx_dma, tx_dma, part) = self.split_dma(rx_dma, tx_dma, irqs);
+        (
+            cc_phy,
+            IdlePdPhy {
+                rx_dma,
+                tx_dma,
+                _part: part,
+            },
+        )
     }
 
-    fn split_disabled_pd_phy<RX, TX>(
+    fn split_dma<RX, TX>(
         self,
         rx_dma: Peri<'d, RX>,
         tx_dma: Peri<'d, TX>,
         irqs: impl interrupt::typelevel::Binding<RX::Interrupt, crate::dma::InterruptHandler<RX>>
         + interrupt::typelevel::Binding<TX::Interrupt, crate::dma::InterruptHandler<TX>>
         + 'd,
-    ) -> (CcPhy<'d, T>, PdPhy<'d, T>)
+    ) -> (CcPhy<'d, T>, ChannelAndRequest<'d>, ChannelAndRequest<'d>, PdPart<T>)
     where
         RX: RxDma<T>,
         TX: TxDma<T>,
@@ -275,14 +291,25 @@ impl<'d, T: Instance> Ucpd<'d, T> {
 
         let rx_dma = new_dma_nonopt!(rx_dma, irqs);
         let tx_dma = new_dma_nonopt!(tx_dma, irqs);
-        (
-            self.cc_phy,
-            PdPhy {
-                _lifetime: PhantomData,
-                rx_dma,
-                tx_dma,
-            },
-        )
+        (self.cc_phy, rx_dma, tx_dma, PdPart(PhantomData))
+    }
+}
+
+/// The PD part of the driver, the counterpart of [`CcPhy`].
+///
+/// Dropping it disables PD reception, and the whole peripheral if the [`CcPhy`] is gone already.
+struct PdPart<T: Instance>(PhantomData<T>);
+
+impl<T: Instance> Drop for PdPart<T> {
+    fn drop(&mut self) {
+        let r = T::REGS;
+        modify_cr::<T>(|w| w.set_phyrxen(false));
+        // Check if the CcPhy part was dropped already.
+        if !T::state().drop_not_ready.clear() {
+            r.cfgr1().write(|w| w.set_ucpden(false));
+            rcc::disable::<T>();
+            T::Interrupt::disable();
+        }
     }
 }
 
@@ -514,25 +541,107 @@ pub enum TxError {
 
 /// Power Delivery (PD) PHY.
 pub struct PdPhy<'d, T: Instance> {
-    _lifetime: PhantomData<&'d mut T>,
-    rx_dma: ChannelAndRequest<'d>,
+    /// Only set for the PD part from [`Ucpd::split_pd_phy`]. Declared first, so that reception
+    /// is switched off before the RX DMA is stopped.
+    _part: Option<PdPart<T>>,
+    rx_ring: ReadableRingBuffer<'d, u8>,
     tx_dma: ChannelAndRequest<'d>,
 }
 
-impl<'d, T: Instance> Drop for PdPhy<'d, T> {
-    fn drop(&mut self) {
-        let r = T::REGS;
-        modify_cr::<T>(|w| w.set_phyrxen(false));
-        // Check if the CcPhy part was dropped already.
-        if !T::state().drop_not_ready.clear() {
-            r.cfgr1().write(|w| w.set_ucpden(false));
-            rcc::disable::<T>();
-            T::Interrupt::disable();
+impl<'d, T: Instance> PdPhy<'d, T> {
+    fn new(
+        rx_dma: ChannelAndRequest<'d>,
+        tx_dma: ChannelAndRequest<'d>,
+        rx_buf: &'d mut [u8],
+        part: Option<PdPart<T>>,
+    ) -> Self {
+        assert!(rx_buf.len() >= MAX_MESSAGE_LEN && rx_buf.len() <= 0xFFFF);
+
+        let rx_ring = unsafe {
+            ReadableRingBuffer::new(
+                rx_dma.channel,
+                rx_dma.request,
+                T::REGS.rxdr().as_ptr() as *mut u8,
+                rx_buf,
+                TransferOptions::default(),
+            )
+        };
+
+        Self {
+            _part: part,
+            rx_ring,
+            tx_dma,
         }
     }
-}
 
-impl<'d, T: Instance> PdPhy<'d, T> {
+    /// Starts receiving on the given CC line.
+    fn start_reception(&mut self, cc_sel: CcSel) {
+        let r = T::REGS;
+
+        // The RX DMA runs for as long as reception is on: RXDR holds a single byte, and a byte
+        // arriving while no DMA is running is lost, and leaves a DMA request pending that the
+        // next DMA would serve with a stale byte. Such a byte is discarded by `flush_rx`.
+        self.rx_ring.start();
+        r.icr().write(|w| w.set_rxhrstdetcf(true));
+        self.flush_rx();
+        r.imr().set_bits(|w| {
+            w.set_rxorddetie(true);
+            w.set_rxmsgendie(true);
+        });
+
+        enable_pd::<T>(cc_sel);
+    }
+
+    /// Stops receiving.
+    fn stop_reception(&mut self) {
+        let r = T::REGS;
+
+        modify_cr::<T>(|w| w.set_phyrxen(false));
+        // Let the DMA, which is still running, take a byte that may still be in RXDR, so that no
+        // DMA request is left pending.
+        while r.sr().read().rxne() {}
+        r.imr().clear_bits(|w| {
+            w.set_rxorddetie(false);
+            w.set_rxmsgendie(false);
+            w.set_rxhrstdetie(false);
+        });
+        self.rx_ring.stop();
+    }
+
+    /// Discards everything received so far and restarts reception.
+    ///
+    /// Used when the message bookkeeping no longer matches the ring buffer: after a Hard Reset,
+    /// an overflow of the ring buffer or the message queue, or a late interrupt. Reception is
+    /// switched off meanwhile, so that no message can be half in, half out.
+    fn resync(&mut self) {
+        modify_cr::<T>(|w| w.set_phyrxen(false));
+        self.flush_rx();
+        modify_cr::<T>(|w| w.set_phyrxen(true));
+    }
+
+    /// [`Self::resync`] for the case that messages were lost.
+    fn overrun(&mut self) -> RxError {
+        self.resync();
+        RxError::Overrun
+    }
+
+    /// Empties the ring buffer and the message bookkeeping, while the RX DMA is running and no
+    /// message is being received.
+    fn flush_rx(&mut self) {
+        let r = T::REGS;
+
+        // Let the DMA take a byte that may still be in RXDR.
+        while r.sr().read().rxne() {}
+        self.rx_ring.clear();
+
+        critical_section::with(|cs| T::state().rx.borrow_ref_mut(cs).reset());
+        r.icr().write(|w| {
+            w.set_rxmsgendcf(true);
+            w.set_rxovrcf(true);
+            w.set_rxorddetcf(true);
+        });
+    }
+
     /// Receives a PD message into the provided buffer.
     ///
     /// Returns the number of received bytes or an error.
@@ -542,67 +651,66 @@ impl<'d, T: Instance> PdPhy<'d, T> {
 
     /// Receives SOP and a PD message into the provided buffer.
     ///
-    /// Returns the start of packet type and number of received bytes or an error.
+    /// Messages are received continuously into the ring buffer given when PD was enabled, so
+    /// messages that arrive between two calls are not lost. Returns the start of packet type and
+    /// number of received bytes of the oldest received message, or an error:
+    ///
+    /// - [`RxError::Crc`] if the message was received with an error.
+    /// - [`RxError::Overrun`] if `buf` is too small for the message, or if received messages had
+    ///   to be discarded: the ring buffer or the message queue overflowed, or the UCPD interrupt
+    ///   was served too late (more than ~300 us after the end of a message) to tell messages
+    ///   apart.
+    /// - [`RxError::HardReset`] if a Hard Reset was received. Messages received before it are
+    ///   discarded.
     pub async fn receive_with_sop(&mut self, buf: &mut [u8]) -> Result<(Sop, usize), RxError> {
         let r = T::REGS;
 
-        let mut dma = unsafe {
-            self.rx_dma
-                .read(r.rxdr().as_ptr() as *mut u8, buf, TransferOptions::default())
-        };
-
-        let _on_drop = OnDrop::new(|| {
-            Self::enable_rx_interrupt(false);
-            // Clear interrupt flags
-            r.icr().write(|w| {
-                w.set_rxorddetcf(true);
-                w.set_rxovrcf(true);
-                w.set_rxmsgendcf(true);
-            });
-        });
-
-        let mut rxpaysz = 0;
-
-        // Stop DMA reception immediately after receiving a packet, to prevent storing multiple packets in the same buffer.
         poll_fn(|cx| {
-            let sr = r.sr().read();
-
-            if sr.rxhrstdet() {
-                dma.request_pause();
-
+            if r.sr().read().rxhrstdet() {
                 // Clean and re-enable hard reset receive interrupt.
                 r.icr().write(|w| w.set_rxhrstdetcf(true));
                 r.imr().set_bits(|w| w.set_rxhrstdetie(true));
-                Poll::Ready(Err(RxError::HardReset))
-            } else if sr.rxmsgend() {
-                dma.request_pause();
-                // Should be read immediately on interrupt.
-                rxpaysz = r.rx_payszr().read().rxpaysz().into();
+                self.resync();
+                return Poll::Ready(Err(RxError::HardReset));
+            }
 
-                let ret = if sr.rxovr() {
-                    Err(RxError::Overrun)
-                } else if sr.rxerr() {
-                    Err(RxError::Crc)
-                } else {
-                    Ok(())
-                };
-                Poll::Ready(ret)
-            } else {
-                T::state().rx_waker.register(cx.waker());
-                Self::enable_rx_interrupt(true);
-                Poll::Pending
+            T::state().rx_waker.register(cx.waker());
+            match critical_section::with(|cs| T::state().rx.borrow_ref_mut(cs).pop()) {
+                Err(Desync) => Poll::Ready(Err(self.overrun())),
+                Ok(None) => Poll::Pending,
+                Ok(Some((msg, queued))) => Poll::Ready(self.read_message(msg, queued, buf)),
             }
         })
-        .await?;
+        .await
+    }
 
-        // Make sure that the last byte was fetched by DMA.
-        while r.sr().read().rxne() {
-            if dma.get_remaining_transfers() == 0 {
-                return Err(RxError::Overrun);
-            }
+    /// Takes the bytes of `msg` out of the ring buffer.
+    ///
+    /// `queued` is the number of bytes of the messages queued after it.
+    fn read_message(&mut self, msg: RxMessage, queued: usize, buf: &mut [u8]) -> Result<(Sop, usize), RxError> {
+        let len = msg.len as usize;
+
+        // The ring buffer holds this message, the queued ones, and at most one message that is
+        // still being received. Anything else means bytes that belong to no recorded message.
+        let plausible = self
+            .rx_ring
+            .len()
+            .is_ok_and(|available| available >= len && available <= len + queued + MAX_MESSAGE_LEN);
+        if !plausible {
+            return Err(self.overrun());
         }
 
-        let sop = match r.rx_ordsetr().read().rxordset() {
+        if let Some(error) = msg.error {
+            self.discard(len)?;
+            return Err(error);
+        }
+        if len > buf.len() {
+            self.discard(len)?;
+            return Err(RxError::Overrun);
+        }
+        self.read_exact(&mut buf[..len])?;
+
+        let sop = match msg.sop {
             Rxordset::Sop => Sop::Sop,
             Rxordset::SopPrime => Sop::SopPrime,
             Rxordset::SopDoublePrime => Sop::SopDoublePrime,
@@ -613,15 +721,31 @@ impl<'d, T: Instance> PdPhy<'d, T> {
             _ => unreachable!(),
         };
 
-        Ok((sop, rxpaysz))
+        Ok((sop, len))
     }
 
-    fn enable_rx_interrupt(enable: bool) {
-        if enable {
-            T::REGS.imr().set_bits(|w| w.set_rxmsgendie(true));
-        } else {
-            T::REGS.imr().clear_bits(|w| w.set_rxmsgendie(false));
+    /// Fills `buf` from the ring buffer.
+    fn read_exact(&mut self, buf: &mut [u8]) -> Result<(), RxError> {
+        let mut read = 0;
+        while read < buf.len() {
+            match self.rx_ring.read(&mut buf[read..]) {
+                Ok((n, _)) if n > 0 => read += n,
+                // Fewer bytes than expected, or the ring buffer overflowed.
+                _ => return Err(self.overrun()),
+            }
         }
+        Ok(())
+    }
+
+    /// Takes `len` bytes out of the ring buffer and drops them.
+    fn discard(&mut self, mut len: usize) -> Result<(), RxError> {
+        let mut scratch = [0u8; 32];
+        while len > 0 {
+            let chunk = len.min(scratch.len());
+            self.read_exact(&mut scratch[..chunk])?;
+            len -= chunk;
+        }
+        Ok(())
     }
 
     /// Transmits an SOP PD message.
@@ -756,32 +880,31 @@ impl<'d, T: Instance> PdPhy<'d, T> {
 /// Power Delivery (PD) PHY with PD communication disabled, created by
 /// [`Ucpd::split_idle_pd_phy`].
 pub struct IdlePdPhy<'d, T: Instance> {
-    pd_phy: PdPhy<'d, T>,
+    rx_dma: ChannelAndRequest<'d>,
+    tx_dma: ChannelAndRequest<'d>,
+    _part: PdPart<T>,
 }
 
 impl<'d, T: Instance> IdlePdPhy<'d, T> {
     /// Enables PD communication on the given CC line.
     ///
-    /// PD reception is disabled again when the returned [`ActivePdPhy`] is dropped.
-    pub fn activate(&mut self, cc_sel: CcSel) -> ActivePdPhy<'_, 'd, T> {
-        let r = T::REGS;
+    /// PD messages are received continuously into `rx_buf`, a ring buffer, until the returned
+    /// [`ActivePdPhy`] is dropped, which disables PD reception again. It must hold at least one
+    /// message of the largest size (264 bytes); a few times that leaves room for messages that
+    /// wait for [`PdPhy::receive`].
+    pub fn activate<'a>(&'a mut self, cc_sel: CcSel, rx_buf: &'a mut [u8]) -> ActivePdPhy<'a, T> {
+        let rx_dma = ChannelAndRequest {
+            channel: self.rx_dma.channel.reborrow(),
+            request: self.rx_dma.request,
+        };
+        let tx_dma = ChannelAndRequest {
+            channel: self.tx_dma.channel.reborrow(),
+            request: self.tx_dma.request,
+        };
 
-        // Discard what a previous activation left behind: a received Hard Reset or message, and
-        // a byte still waiting in RXDR, which the next reception would otherwise pick up.
-        r.icr().write(|w| {
-            w.set_rxhrstdetcf(true);
-            w.set_rxmsgendcf(true);
-            w.set_rxovrcf(true);
-            w.set_rxorddetcf(true);
-        });
-        if r.sr().read().rxne() {
-            r.rxdr().read();
-        }
-
-        enable_pd::<T>(cc_sel);
-        ActivePdPhy {
-            pd_phy: &mut self.pd_phy,
-        }
+        let mut pd_phy = PdPhy::new(rx_dma, tx_dma, rx_buf, None);
+        pd_phy.start_reception(cc_sel);
+        ActivePdPhy { pd_phy }
     }
 }
 
@@ -789,29 +912,27 @@ impl<'d, T: Instance> IdlePdPhy<'d, T> {
 ///
 /// Derefs to [`PdPhy`] for receiving and transmitting messages. Dropping it disables PD
 /// reception.
-pub struct ActivePdPhy<'a, 'd, T: Instance> {
-    pd_phy: &'a mut PdPhy<'d, T>,
+pub struct ActivePdPhy<'a, T: Instance> {
+    pd_phy: PdPhy<'a, T>,
 }
 
-impl<'a, 'd, T: Instance> Drop for ActivePdPhy<'a, 'd, T> {
+impl<'a, T: Instance> Drop for ActivePdPhy<'a, T> {
     fn drop(&mut self) {
-        // Undo `enable_pd`, apart from the CC line selection, which only matters while enabled.
-        modify_cr::<T>(|w| w.set_phyrxen(false));
-        T::REGS.imr().clear_bits(|w| w.set_rxhrstdetie(false));
+        self.pd_phy.stop_reception();
     }
 }
 
-impl<'a, 'd, T: Instance> Deref for ActivePdPhy<'a, 'd, T> {
-    type Target = PdPhy<'d, T>;
+impl<'a, T: Instance> Deref for ActivePdPhy<'a, T> {
+    type Target = PdPhy<'a, T>;
 
     fn deref(&self) -> &Self::Target {
-        self.pd_phy
+        &self.pd_phy
     }
 }
 
-impl<'a, 'd, T: Instance> DerefMut for ActivePdPhy<'a, 'd, T> {
+impl<'a, T: Instance> DerefMut for ActivePdPhy<'a, T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        self.pd_phy
+        &mut self.pd_phy
     }
 }
 
@@ -862,8 +983,8 @@ impl<T: Instance> interrupt::typelevel::Handler<T::Interrupt> for InterruptHandl
             state.tx_waker.wake();
         }
 
-        if sr.rxmsgend() {
-            r.imr().clear_bits(|w| w.set_rxmsgendie(false));
+        if sr.rxorddet() || sr.rxmsgend() {
+            critical_section::with(|cs| state.rx.borrow_ref_mut(cs).on_interrupt(r, sr));
             state.rx_waker.wake();
         }
 
@@ -887,6 +1008,116 @@ impl<T: Instance> interrupt::typelevel::Handler<T::Interrupt> for InterruptHandl
     }
 }
 
+/// Size of the largest message: header, extended header and 260 data bytes of an unchunked
+/// extended message.
+const MAX_MESSAGE_LEN: usize = 264;
+
+/// Number of received messages that can wait for [`PdPhy::receive`].
+const RX_QUEUE_LEN: usize = 8;
+
+/// The message bookkeeping no longer matches the RX ring buffer, see [`PdPhy::resync`].
+struct Desync;
+
+/// A message received into the RX ring buffer, recorded at its end.
+#[derive(Clone, Copy)]
+struct RxMessage {
+    /// Number of bytes the message occupies in the ring buffer (RXPAYSZ).
+    len: u16,
+    sop: Rxordset,
+    error: Option<RxError>,
+}
+
+/// Bookkeeping of the messages in the RX ring buffer, shared by the interrupt and the receiver.
+///
+/// The RX DMA runs continuously into the ring buffer, so the bytes of all messages follow each
+/// other there. Their boundaries are only known from RXPAYSZ, RX_ORDSETR and the error flags,
+/// which the next message overwrites, so the interrupt records them for every message.
+struct RxState {
+    queue: heapless::Deque<RxMessage, RX_QUEUE_LEN>,
+    /// SOP of the message currently being received, recorded at its start.
+    sop: Option<Rxordset>,
+    /// The bookkeeping no longer matches the ring buffer.
+    desync: bool,
+}
+
+impl RxState {
+    const fn new() -> Self {
+        Self {
+            queue: heapless::Deque::new(),
+            sop: None,
+            desync: false,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.queue.clear();
+        self.sop = None;
+        self.desync = false;
+    }
+
+    /// Takes the oldest message, along with the number of bytes of the messages queued after it.
+    fn pop(&mut self) -> Result<Option<(RxMessage, usize)>, Desync> {
+        if self.desync {
+            return Err(Desync);
+        }
+        let msg = self.queue.pop_front();
+        let queued = self.queue.iter().map(|m| m.len as usize).sum();
+        Ok(msg.map(|msg| (msg, queued)))
+    }
+
+    /// Records the start (RXORDDET) and end (RXMSGEND) of messages.
+    ///
+    /// RX_ORDSETR is valid from the start of a message until the start of the next one, and
+    /// RXPAYSZ and the error flags from its end until the next one starts, at least ~300 us
+    /// (inter-frame gap, preamble and SOP). If the interrupt is served later than that, the
+    /// values can't be attributed reliably, and the receiver resynchronizes instead.
+    fn on_interrupt(&mut self, r: crate::pac::ucpd::Ucpd, sr: crate::pac::ucpd::regs::Sr) {
+        if sr.rxorddet() && sr.rxmsgend() {
+            // The start and the end of a message, or the end of one and the start of the next,
+            // were both pending: served too late to tell which values belong to which message.
+            r.icr().write(|w| {
+                w.set_rxorddetcf(true);
+                w.set_rxmsgendcf(true);
+                w.set_rxovrcf(true);
+            });
+            self.sop = None;
+            self.desync = true;
+        } else if sr.rxorddet() {
+            r.icr().write(|w| w.set_rxorddetcf(true));
+            if self.sop.is_some() {
+                // The end of the previous message was missed.
+                self.desync = true;
+            }
+            self.sop = Some(r.rx_ordsetr().read().rxordset());
+        } else if sr.rxmsgend() {
+            let len = r.rx_payszr().read().rxpaysz();
+            let error = if sr.rxovr() {
+                Some(RxError::Overrun)
+            } else if sr.rxerr() {
+                Some(RxError::Crc)
+            } else {
+                None
+            };
+            r.icr().write(|w| {
+                w.set_rxmsgendcf(true);
+                w.set_rxovrcf(true);
+            });
+
+            let sop = self.sop.take();
+            // If the next message has already started, the values read above may belong to it.
+            let next_started = r.sr().read().rxorddet();
+            match sop {
+                Some(sop) if !next_started => {
+                    if self.queue.push_back(RxMessage { len, sop, error }).is_err() {
+                        self.desync = true;
+                    }
+                }
+                _ => self.desync = true,
+            }
+        }
+    }
+}
+
 struct State {
     // CcPhy and PdPhy can be used from different tasks at the same time, and an AtomicWaker only
     // holds one waker, so each wait has its own.
@@ -895,6 +1126,7 @@ struct State {
     tx_waker: AtomicWaker,
     // Inverted logic for a default state of 0 so that the data goes into the .bss section.
     drop_not_ready: AtomicBool,
+    rx: Mutex<RefCell<RxState>>,
 }
 
 impl State {
@@ -904,6 +1136,7 @@ impl State {
             rx_waker: AtomicWaker::new(),
             tx_waker: AtomicWaker::new(),
             drop_not_ready: AtomicBool::new(false),
+            rx: Mutex::new(RefCell::new(RxState::new())),
         }
     }
 }
