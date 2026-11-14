@@ -11,7 +11,7 @@ use defmt::{assert, assert_eq};
 use embassy_executor::Spawner;
 use embassy_futures::join::join;
 use embassy_futures::yield_now;
-use embassy_stm32::ucpd::{self, ActivePdPhy, CcPhy, CcPull, CcSel, CcVState, RxBuffers, RxError, Ucpd};
+use embassy_stm32::ucpd::{self, ActivePdPhy, CcPhy, CcPull, CcSel, CcVState, PdPhy, RxBuffers, RxError, Ucpd};
 use embassy_stm32::{Peri, bind_interrupts, peripherals};
 use embassy_time::{Duration, Timer, block_for, with_timeout};
 
@@ -103,6 +103,23 @@ async fn expect_message_after_restart<T: ucpd::Instance>(pd_phy: &mut ActivePdPh
     }
 }
 
+/// Receives until `MESSAGES[1]` after the sink cancelled a transmission of `LONG_MESSAGE`.
+///
+/// Before it, the source may receive what the sink sent of the long message: it went on after its
+/// DMA stopped, so with its full length but any bytes, or cut short, with a CRC error. The short
+/// message after it must arrive intact, and not, for example, shifted by a byte that the first
+/// TX DMA request served before the transmission started.
+async fn expect_message_after_cancelled_transmission<T: ucpd::Instance>(pd_phy: &mut PdPhy<'_, T>) {
+    let mut buf = [0_u8; 264];
+    loop {
+        match pd_phy.receive(buf.as_mut()).await {
+            Ok(n) if buf[..n] == MESSAGES[1] => return,
+            Ok(n) => assert_eq!(n, LONG_MESSAGE.len()),
+            Err(error) => assert!(matches!(error, RxError::Crc)),
+        }
+    }
+}
+
 async fn source(
     mut ucpd: Ucpd<'static, peripherals::UCPD1>,
     rx_dma: Peri<'static, peripherals::DMA1_CH1>,
@@ -157,6 +174,12 @@ async fn source(
         unwrap!(pd_phy.transmit(&LONG_MESSAGE).await);
         SINK_READY.wait().await;
         unwrap!(pd_phy.transmit(&MESSAGES[0]).await);
+    }
+
+    // The sink cancels transmissions of a long message, and its next message arrives intact.
+    debug!("source: receiving after cancelled transmissions");
+    for _ in 0..STOP_STEPS {
+        expect_message_after_cancelled_transmission(&mut pd_phy).await;
     }
 
     // Wait for hard-reset
@@ -236,6 +259,18 @@ async fn sink(
         let mut pd_phy = idle_pd_phy.activate(CcSel::Cc1, &mut rx_buffers);
         SINK_READY.set();
         expect_message_after_restart(&mut pd_phy).await;
+    }
+
+    // Cancelling a transmission in the middle of a long message, and going through `IdlePdPhy`,
+    // doesn't affect the next transmission.
+    debug!("sink: cancelling transmissions of long messages");
+    for step in 0..STOP_STEPS {
+        let mut pd_phy = idle_pd_phy.activate(CcSel::Cc1, &mut rx_buffers);
+        let _ = with_timeout(Duration::from_micros(300 * step), pd_phy.transmit(&LONG_MESSAGE)).await;
+        drop(pd_phy);
+
+        let mut pd_phy = idle_pd_phy.activate(CcSel::Cc1, &mut rx_buffers);
+        unwrap!(pd_phy.transmit(&MESSAGES[1]).await);
     }
     let mut pd_phy = idle_pd_phy.activate(CcSel::Cc1, &mut rx_buffers);
 
